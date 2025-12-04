@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 
 from triton_dist.kernels.intel.common_ops import barrier_all_intra_node_non_atomic, wait_signal_range
 from triton_dist.kernels.intel.allgather import AllGatherMethod, cp_engine_producer_all_gather_intra_node, get_auto_all_gather_method, cp_engine_producer_all_gather_inter_node
-from triton_dist.kernels.intel.ag_gemm_threadblock_swizzle import threadblock_swizzle_allgather_gemm_kernel
 from triton_dist.utils import NVSHMEM_SIGNAL_DTYPE, nvshmem_barrier_all_on_stream
 from triton_dist.kernels.intel.symm_utils import ishmem_create_tensors
 
@@ -356,7 +355,7 @@ class AllGatherGEMMTensorParallelContext:
         self.local_rank = self.rank % self.num_local_ranks
 
         # create symmetric workspace from pytorch symmetric memory
-        
+
         self.symm_workspaces = ishmem_create_tensors((self.max_M, self.K), self.tensor_dtype, self.rank,
                                                       self.num_local_ranks)
         self.symm_workspace = self.symm_workspaces[self.local_rank]

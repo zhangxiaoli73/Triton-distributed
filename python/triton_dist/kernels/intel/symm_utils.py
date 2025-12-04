@@ -22,10 +22,13 @@ import numpy as np
 import packaging.version
 import torch
 
+from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+from torch._C._distributed_c10d import _SymmetricMemory
+
 # Some code from python/flux/util.py in flux project
 
 _TP_GROUP = None
-
+_group_name_to_workspace_tensor: dict[str, torch.Tensor | None] = {}
 
 def init_seed(seed=0):
     torch.use_deterministic_algorithms(True, warn_only=True)
@@ -46,6 +49,36 @@ def ishmem_create_tensor(shape, dtype) -> torch.Tensor:
     torch.xpu.synchronize()
     return tensor
 
+def create_symmetric_handle(shape, dtype, group_name) -> _SymmetricMemory:
+    enable_symm_mem_for_group(group_name)
+    tensor = _group_name_to_workspace_tensor.get(group_name)
+    size = tensor.numel() * tensor.element_size() if tensor is not None else 0
+    req_size = 1
+    for s in shape:
+        req_size *= s
+    req_size *= torch.empty([], dtype=dtype).element_size()
+    if tensor is None or size < req_size:
+        # need calculate stride ?
+        tensor = _SymmetricMemory.empty_strided_p2p(
+            shape,
+            torch._prims_common.make_contiguous_strides_for(shape),
+            dtype,
+            torch.device(f"xpu:{torch.xpu.current_device()}"),
+            group_name,
+        )
+        _group_name_to_workspace_tensor[group_name] = tensor
+    return _SymmetricMemory.rendezvous(tensor)
+
+def get_remote_tensors(local_sm_handle, local_tensor, rank, local_world_size) -> List[torch.Tensor]:
+    def _get_peer_tensor(t, peer) -> torch.Tensor:
+        if peer == rank:
+            return t
+        return local_sm_handle.get_buffer(peer, tuple(t.size()), t.dtype)
+
+    local_rank = rank % local_world_size
+    rank_on_same_node_start = rank - local_rank
+    rank_on_same_node_end = rank_on_same_node_start + local_world_size
+    return [_get_peer_tensor(local_tensor, peer) for peer in range(rank_on_same_node_start, rank_on_same_node_end)]
 
 def ishmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.Tensor]:
     """
@@ -61,21 +94,12 @@ def ishmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.Te
     local_rank = rank % local_world_size
     torch.xpu.synchronize()
 
-    # Create a list of tensors (placeholder - each rank creates its own)
-    # TODO: Implement proper IPC memory sharing for Intel XPU
-    tensors = []
-    for i in range(local_world_size):
-        if i == local_rank:
-            # Create local tensor
-            tensor = torch.empty(shape, dtype=dtype, device="xpu")
-        else:
-            # Placeholder: in real implementation, this should get IPC handle
-            # from peer and map it to local address space
-            tensor = torch.empty(shape, dtype=dtype, device="xpu")
-        tensors.append(tensor)
+    # Create a list of tensors (placeholder - each rank creates its own), WA with pytorch symmetric memory
 
-    torch.xpu.synchronize()
-    return tensors
+    gp = torch.distributed.new_group(ranks=list(range(local_world_size)), backend="xccl")
+    symm_handle = create_symmetric_handle(shape, dtype, gp.group_name)
+    symm_comm = get_remote_tensors(symm_handle, _group_name_to_workspace_tensor[symm_handle], rank, local_world_size)
+    return symm_comm
 
 
 def finalize_distributed():
@@ -124,7 +148,7 @@ def initialize_distributed(seed=None) -> torch.distributed.ProcessGroup:
     torch.xpu.set_device(LOCAL_RANK)
 
     torch.distributed.init_process_group(
-        backend="cpu:gloo,xpu:ccl",  # Use CCL for Intel XPU
+        backend="cpu:gloo,xpu:xccl",  # Use CCL for Intel XPU
         world_size=WORLD_SIZE,
         rank=RANK,
         timeout=datetime.timedelta(seconds=1800),
@@ -132,7 +156,7 @@ def initialize_distributed(seed=None) -> torch.distributed.ProcessGroup:
     assert torch.distributed.is_initialized()
 
     # Use CCL backend for Intel XPU tensor parallelism
-    _TP_GROUP = torch.distributed.new_group(ranks=list(range(WORLD_SIZE)), backend="ccl")
+    _TP_GROUP = torch.distributed.new_group(ranks=list(range(WORLD_SIZE)), backend="xccl")
     torch.distributed.barrier(_TP_GROUP)
 
     _TP_GROUP_GLOO = torch.distributed.new_group(ranks=list(range(WORLD_SIZE)), backend="gloo")
