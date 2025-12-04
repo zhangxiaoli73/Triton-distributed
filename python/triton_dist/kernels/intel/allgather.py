@@ -73,7 +73,7 @@ def get_auto_all_gather_method(num_ranks: int, num_local_ranks: int) -> AllGathe
         if numa_world_size == num_ranks:
             return AllGatherMethod.Ring1D_IntraNode
         else:
-            return AllGatherMethod.Ring2D_IntraNode
+            return AllGatherMethod.Ring1D_IntraNode # todo: support 2D for numa node
     else:
         # Multi-node
         return AllGatherMethod.Ring2D_InterNode
@@ -109,16 +109,20 @@ def cp_engine_producer_all_gather_full_mesh_push(
     Full-mesh push AllGather for Intel XPU.
 
     Each rank pushes its data to all other ranks' buffers.
+
+    Note: remote_tensor_buffers and barrier_buffers are indexed by local_rank (0 to num_ranks-1).
     """
+    # For intra-node communication, rank == local_rank since num_ranks == num_local_ranks
+    local_rank = rank % num_ranks
     M_per_rank, N_per_rank = local_tensor.shape
-    push_order = [(rank + i) % num_ranks for i in range(num_ranks)]
+    push_order = [(local_rank + i) % num_ranks for i in range(num_ranks)]
     src = local_tensor
     with torch.xpu.stream(stream):
-        for dst_rank in push_order:
-            dst = remote_tensor_buffers[dst_rank][rank * M_per_rank:(rank + 1) * M_per_rank, :]
+        for dst_local_rank in push_order:
+            dst = remote_tensor_buffers[dst_local_rank][local_rank * M_per_rank:(local_rank + 1) * M_per_rank, :]
             dst.copy_(src)
             # Set signal to indicate data is ready
-            barrier_buffers[dst_rank][rank].fill_(1)
+            barrier_buffers[dst_local_rank][local_rank].fill_(1)
 
 
 def cp_engine_producer_all_gather_full_mesh_pull(
@@ -134,29 +138,33 @@ def cp_engine_producer_all_gather_full_mesh_pull(
     Full-mesh pull AllGather for Intel XPU.
 
     Each rank pulls data from all other ranks' buffers to its own buffer.
+
+    Note: remote_tensor_buffers and barrier_buffers are indexed by local_rank (0 to num_ranks-1).
     """
     log = get_logger(rank)
     log.info(f"[full_mesh_pull] Starting: num_ranks={num_ranks}, tensor_shape={local_tensor.shape}")
 
+    # For intra-node communication, rank == local_rank since num_ranks == num_local_ranks
+    local_rank = rank % num_ranks
     M_per_rank, _ = local_tensor.shape
-    rank_orders = [(rank + i) % num_ranks for i in range(num_ranks)]
+    rank_orders = [(local_rank + i) % num_ranks for i in range(num_ranks)]
 
     with torch.xpu.stream(stream):
         if for_correctness:
             # fake a slow communication case
             # test if the computation is waiting for the correct communication
             _add_noise_workload_debug()
-        for idx, src_rank in enumerate(rank_orders):
-            if src_rank == rank:
-                log.info(f"[full_mesh_pull] Skipping self (src_rank={src_rank})")
+        for idx, src_local_rank in enumerate(rank_orders):
+            if src_local_rank == local_rank:
+                log.info(f"[full_mesh_pull] Skipping self (src_local_rank={src_local_rank})")
                 continue
-            log.info(f"[full_mesh_pull] Copying from rank {src_rank} ({idx+1}/{num_ranks})")
-            dst = remote_tensor_buffers[rank][src_rank * M_per_rank:(src_rank + 1) * M_per_rank, :]
-            src = remote_tensor_buffers[src_rank][src_rank * M_per_rank:(src_rank + 1) * M_per_rank, :]
+            log.info(f"[full_mesh_pull] Copying from local_rank {src_local_rank} ({idx+1}/{num_ranks})")
+            dst = remote_tensor_buffers[local_rank][src_local_rank * M_per_rank:(src_local_rank + 1) * M_per_rank, :]
+            src = remote_tensor_buffers[src_local_rank][src_local_rank * M_per_rank:(src_local_rank + 1) * M_per_rank, :]
             dst.copy_(src)
             # Set signal to indicate data is ready
-            barrier_buffers[rank][src_rank].fill_(1)
-            log.info(f"[full_mesh_pull] Copied from rank {src_rank}, barrier set")
+            barrier_buffers[local_rank][src_local_rank].fill_(1)
+            log.info(f"[full_mesh_pull] Copied from local_rank {src_local_rank}, barrier set")
     log.info(f"[full_mesh_pull] Completed")
 
 
@@ -173,39 +181,46 @@ def cp_engine_producer_all_gather_ring_push_1d(
     1D Ring AllGather for Intel XPU.
 
     Each rank passes data to the next rank in a ring pattern.
+
+    Note: remote_tensor_buffers and barrier_buffers are indexed by local_rank (0 to num_ranks-1),
+    since they are created by ishmem_create_tensors which returns tensors indexed by local rank.
     """
     log = get_logger(rank)
     log.info(f"[ring_push_1d] Starting: num_ranks={num_ranks}, tensor_shape={local_tensor.shape}")
 
+    # For intra-node communication, rank == local_rank since num_ranks == num_local_ranks
+    # The buffers are indexed from 0 to num_ranks-1 (local rank indexing)
+    local_rank = rank % num_ranks  # In intra-node case, this equals rank
+
     poll_count = [0]  # Use list for mutable in closure
 
-    def wait_ready(rank: int, segment: int):
+    def wait_ready(local_rank_idx: int, segment: int):
         """Wait for a segment to be ready (polling-based with proper sync)."""
-        log.info(f"[ring_push_1d] wait_ready: waiting for rank={rank}, segment={segment}")
+        log.info(f"[ring_push_1d] wait_ready: waiting for local_rank={local_rank_idx}, segment={segment}")
         # 必须同步当前 stream，确保能看到其他 GPU 的写入
         torch.xpu.synchronize()
         poll_count[0] = 0
-        while barrier_buffers[rank][segment].item() != 1:
+        while barrier_buffers[local_rank_idx][segment].item() != 1:
             poll_count[0] += 1
             if poll_count[0] % 10000 == 0:
-                log.warning(f"[ring_push_1d] wait_ready: STILL waiting for rank={rank}, segment={segment}, poll_count={poll_count[0]}, barrier_value={barrier_buffers[rank][segment].item()}")
+                log.warning(f"[ring_push_1d] wait_ready: STILL waiting for local_rank={local_rank_idx}, segment={segment}, poll_count={poll_count[0]}, barrier_value={barrier_buffers[local_rank_idx][segment].item()}")
             # 添加小延迟避免过度轮询
             time.sleep(0.0001)
             torch.xpu.synchronize()  # 刷新缓存，重新读取
-        log.info(f"[ring_push_1d] wait_ready: ready! rank={rank}, segment={segment}, poll_count={poll_count[0]}")
+        log.info(f"[ring_push_1d] wait_ready: ready! local_rank={local_rank_idx}, segment={segment}, poll_count={poll_count[0]}")
 
-    def set_ready(rank: int, segment: int):
+    def set_ready(local_rank_idx: int, segment: int):
         """Set a segment as ready with proper synchronization."""
-        log.info(f"[ring_push_1d] set_ready: setting rank={rank}, segment={segment}")
+        log.info(f"[ring_push_1d] set_ready: setting local_rank={local_rank_idx}, segment={segment}")
         # 确保之前的 copy 操作完成
         torch.xpu.synchronize()
-        barrier_buffers[rank][segment].fill_(1)
+        barrier_buffers[local_rank_idx][segment].fill_(1)
         torch.xpu.synchronize()  # 确保信号写入完成
-        log.info(f"[ring_push_1d] set_ready: done rank={rank}, segment={segment}")
+        log.info(f"[ring_push_1d] set_ready: done local_rank={local_rank_idx}, segment={segment}")
 
     M_per_rank, _ = local_tensor.shape
-    to_rank = (rank - 1 + num_ranks) % num_ranks
-    log.info(f"[ring_push_1d] to_rank={to_rank}, M_per_rank={M_per_rank}")
+    to_local_rank = (local_rank - 1 + num_ranks) % num_ranks
+    log.info(f"[ring_push_1d] local_rank={local_rank}, to_local_rank={to_local_rank}, M_per_rank={M_per_rank}")
 
     with torch.xpu.stream(stream):
         if for_correctness:
@@ -214,17 +229,17 @@ def cp_engine_producer_all_gather_ring_push_1d(
             _add_noise_workload_debug()
 
         for stage in range(num_ranks - 1):
-            send_segment = (rank + stage) % num_ranks
+            send_segment = (local_rank + stage) % num_ranks
             M_start = send_segment * M_per_rank
             M_end = M_start + M_per_rank
             log.info(f"[ring_push_1d] Stage {stage}/{num_ranks-1}: send_segment={send_segment}, M_range=[{M_start}, {M_end})")
             if stage != 0:
-                wait_ready(rank, send_segment)
-            log.info(f"[ring_push_1d] Stage {stage}: copying data to rank {to_rank}")
-            dst = remote_tensor_buffers[to_rank][M_start:M_end, :]
-            src = remote_tensor_buffers[rank][M_start:M_end, :]
+                wait_ready(local_rank, send_segment)
+            log.info(f"[ring_push_1d] Stage {stage}: copying data to local_rank {to_local_rank}")
+            dst = remote_tensor_buffers[to_local_rank][M_start:M_end, :]
+            src = remote_tensor_buffers[local_rank][M_start:M_end, :]
             dst.copy_(src)
-            set_ready(to_rank, send_segment)
+            set_ready(to_local_rank, send_segment)
             log.info(f"[ring_push_1d] Stage {stage}: completed")
     log.info(f"[ring_push_1d] All stages completed")
 

@@ -123,13 +123,13 @@ def barrier_all_intra_node_atomic_cas_block(local_rank, rank, local_world_size, 
     """
     # Phase 1: Signal all other ranks that we have arrived
     for i in range(local_world_size):
-        remote_base_ptr = tl.load(symm_flag_ptrs + i).to(tl.pointer_type(tl.int32))
+        remote_base_ptr = tl.load(symm_flag_ptrs + i).to(tl.int64).to(tl.pointer_type(tl.int32))
         # Try to set remote_ptr[local_rank] from 0 to 1
         while tl.atomic_cas(remote_base_ptr + local_rank, 0, 1, sem="release", scope="sys") != 0:
             pass
 
     # Phase 2: Wait for all other ranks to signal us
-    local_base_ptr = tl.load(symm_flag_ptrs + local_rank).to(tl.pointer_type(tl.int32))
+    local_base_ptr = tl.load(symm_flag_ptrs + local_rank).to(tl.int64).to(tl.pointer_type(tl.int32))
     for i in range(local_world_size):
         # Wait until local_ptr[i] becomes 1, then reset to 0
         while tl.atomic_cas(local_base_ptr + i, 1, 0, sem="acquire", scope="sys") != 1:
@@ -154,7 +154,7 @@ def _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, local_world_
     """
     # Each rank writes target_value to its slot in all other ranks' buffers
     for i in range(local_world_size):
-        remote_base_ptr = tl.load(symm_flag_ptrs + i).to(tl.pointer_type(tl.int32))
+        remote_base_ptr = tl.load(symm_flag_ptrs + i).to(tl.int64).to(tl.pointer_type(tl.int32))
         # Write our target_value to remote_ptr[local_rank]
         tl.store(remote_base_ptr + local_rank, target_value)
 
@@ -162,7 +162,7 @@ def _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, local_world_
     tl.debug_barrier()
 
     # Wait for all other ranks to write their target_value to our buffer
-    local_base_ptr = tl.load(symm_flag_ptrs + local_rank).to(tl.pointer_type(tl.int32))
+    local_base_ptr = tl.load(symm_flag_ptrs + local_rank).to(tl.int64).to(tl.pointer_type(tl.int32))
     for i in range(local_world_size):
         # Spin until we see target_value from rank i
         while tl.load(local_base_ptr + i) != target_value:
