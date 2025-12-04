@@ -104,22 +104,32 @@ def get_remote_tensors(local_sm_handle, local_tensor, rank, local_world_size) ->
     log = get_symm_logger(rank)
     log.info(f"[get_remote_tensors] Starting: rank={rank}, local_world_size={local_world_size}, tensor_shape={local_tensor.shape}")
 
-    def _get_peer_tensor(t, peer) -> torch.Tensor:
-        if peer == rank:
-            log.info(f"[get_remote_tensors] Peer {peer} is self, returning local tensor")
+    local_rank = rank % local_world_size
+
+    def _get_peer_tensor(t, peer_local_rank) -> torch.Tensor:
+        """Get tensor for a peer using group-local rank (0 to local_world_size-1)."""
+        if peer_local_rank == local_rank:
+            log.info(f"[get_remote_tensors] Peer local_rank {peer_local_rank} is self, returning local tensor")
             return t
-        log.info(f"[get_remote_tensors] Getting buffer for peer {peer}")
-        result = local_sm_handle.get_buffer(peer, tuple(t.size()), t.dtype)
-        log.info(f"[get_remote_tensors] Got buffer for peer {peer}")
+        log.info(f"[get_remote_tensors] Getting buffer for peer local_rank {peer_local_rank}")
+        result = local_sm_handle.get_buffer(peer_local_rank, tuple(t.size()), t.dtype)
+        log.info(f"[get_remote_tensors] Got buffer for peer local_rank {peer_local_rank}, data_ptr={result.data_ptr()}")
         return result
 
-    local_rank = rank % local_world_size
-    rank_on_same_node_start = rank - local_rank
-    rank_on_same_node_end = rank_on_same_node_start + local_world_size
-    log.info(f"[get_remote_tensors] Fetching tensors from peers {rank_on_same_node_start} to {rank_on_same_node_end}")
+    log.info(f"[get_remote_tensors] local_rank={local_rank}, fetching tensors for local_ranks 0 to {local_world_size-1}")
 
-    result = [_get_peer_tensor(local_tensor, peer) for peer in range(rank_on_same_node_start, rank_on_same_node_end)]
+    # The result list is indexed by local_rank (0 to local_world_size-1)
+    # get_buffer expects group-local rank, which matches local_rank
+    result = [_get_peer_tensor(local_tensor, peer_local_rank) for peer_local_rank in range(local_world_size)]
     log.info(f"[get_remote_tensors] Got {len(result)} tensors")
+
+    # Validate that all tensors have valid data pointers
+    for i, t in enumerate(result):
+        if t.data_ptr() == 0:
+            log.error(f"[get_remote_tensors] ERROR: Tensor at index {i} has null data pointer!")
+        else:
+            log.info(f"[get_remote_tensors] Tensor[{i}] data_ptr={t.data_ptr()}")
+
     return result
 
 def ishmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.Tensor]:

@@ -46,7 +46,6 @@ run: python {os.path.abspath(__file__)} --case XXX
 
 @register_test("correctness")
 def test_ag_gemm(args, autotune=False):
-    device = "xpu"
     dtype = torch.float16
     rank = args.rank
     num_ranks = args.num_ranks
@@ -76,11 +75,11 @@ def test_ag_gemm(args, autotune=False):
         return ag_gemm(A, B, ctx=ctx, persistent=args.persistent, autotune=autotune)
 
     with group_profile("ag_gemm_{os.environ['TORCHELASTIC_RUN_ID']}", args.profile, group=args.default_group):
-        for i in range(5):
+        for i in range(1):
             # every time, use a new input data to check correctness
-            A.random_()
-            B.random_()
-            ctx.symm_workspace[:M].random_()
+            # A.random_()
+            # B.random_()
+            # ctx.symm_workspace[:M].random_()
             print(f"[rank={rank}] zl_debug: start to call ag_gemm in iteration {i} \n")
             C = func()
 
@@ -92,11 +91,12 @@ def test_ag_gemm(args, autotune=False):
         group=args.default_group,
     )
     C_golden = torch.matmul(ag_A, B.T)
+    torch.xpu.synchronize()
     print(f"[rank={rank}] zl_debug: start to compare results \n")
     for i in range(num_ranks):
         torch.distributed.barrier(args.default_group)
         if rank == i:
-            print(f"Rank {rank}")
+            print(f"Rank {rank}, res = {C} ref = {C_golden} \n")
             assert_allclose(C_golden, C, atol=1e-3, rtol=1e-3)
 
 

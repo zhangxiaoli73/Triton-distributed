@@ -161,7 +161,7 @@ def cp_engine_producer_all_gather_full_mesh_pull(
             log.info(f"[full_mesh_pull] Copying from local_rank {src_local_rank} ({idx+1}/{num_ranks})")
             dst = remote_tensor_buffers[local_rank][src_local_rank * M_per_rank:(src_local_rank + 1) * M_per_rank, :]
             src = remote_tensor_buffers[src_local_rank][src_local_rank * M_per_rank:(src_local_rank + 1) * M_per_rank, :]
-            dst.copy_(src)
+            dst.copy_(src) # pull from remote to local index (peer rank corresponding to local index)
             # Set signal to indicate data is ready
             barrier_buffers[local_rank][src_local_rank].fill_(1)
             log.info(f"[full_mesh_pull] Copied from local_rank {src_local_rank}, barrier set")
@@ -197,8 +197,6 @@ def cp_engine_producer_all_gather_ring_push_1d(
     def wait_ready(local_rank_idx: int, segment: int):
         """Wait for a segment to be ready (polling-based with proper sync)."""
         log.info(f"[ring_push_1d] wait_ready: waiting for local_rank={local_rank_idx}, segment={segment}")
-        # 必须同步当前 stream，确保能看到其他 GPU 的写入
-        torch.xpu.synchronize()
         poll_count[0] = 0
         while barrier_buffers[local_rank_idx][segment].item() != 1:
             poll_count[0] += 1
@@ -263,14 +261,16 @@ def cp_engine_producer_all_gather_intra_node(
     log.info(f"[intra_node] Starting: method={all_gather_method}, num_ranks={num_ranks}, tensor_shape={local_tensor.shape}")
     log.info(f"[intra_node] remote_tensor_buffers count={len(remote_tensor_buffers)}, barrier_buffers count={len(barrier_buffers)}")
 
-    if all_gather_method == AllGatherMethod.All2All_IntraNode:
-        fn = cp_engine_producer_all_gather_full_mesh_pull
-        log.info(f"[intra_node] Using full_mesh_pull")
-    elif all_gather_method == AllGatherMethod.Ring1D_IntraNode:
-        fn = cp_engine_producer_all_gather_ring_push_1d
-        log.info(f"[intra_node] Using ring_push_1d")
-    else:
-        raise Exception(f"Unsupported allgather method: {all_gather_method}")
+    fn = cp_engine_producer_all_gather_full_mesh_pull
+
+    # if all_gather_method == AllGatherMethod.All2All_IntraNode:
+    #     fn = cp_engine_producer_all_gather_full_mesh_pull
+    #     log.info(f"[intra_node] Using full_mesh_pull")
+    # elif all_gather_method == AllGatherMethod.Ring1D_IntraNode:
+    #     fn = cp_engine_producer_all_gather_ring_push_1d
+    #     log.info(f"[intra_node] Using ring_push_1d")
+    # else:
+    #     raise Exception(f"Unsupported allgather method: {all_gather_method}")
 
     log.info(f"[intra_node] Calling AllGather function")
     fn(
