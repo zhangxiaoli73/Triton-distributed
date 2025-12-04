@@ -1,9 +1,9 @@
+import logging
+import os
+
 import torch
 import triton
 import triton.language as tl
-# from triton_dist.kernels.nvidia.common_ops import _set_signal_cuda
-# import triton_dist.language as dl
-# from triton.language.extra.cuda.language_extra import tid, st
 
 from typing import Optional, List
 from dataclasses import dataclass, field
@@ -12,6 +12,25 @@ from triton_dist.kernels.intel.common_ops import barrier_all_intra_node_non_atom
 from triton_dist.kernels.intel.allgather import AllGatherMethod, cp_engine_producer_all_gather_intra_node, get_auto_all_gather_method, cp_engine_producer_all_gather_inter_node
 from triton_dist.utils import NVSHMEM_SIGNAL_DTYPE, nvshmem_barrier_all_on_stream
 from triton_dist.kernels.intel.symm_utils import ishmem_create_tensors
+
+# Setup logging for debugging
+_log_level = os.environ.get("TRITON_DIST_LOG_LEVEL", "WARNING").upper()
+logging.basicConfig(level=getattr(logging, _log_level, logging.WARNING),
+                    format='[%(asctime)s][Rank %(rank)s][%(levelname)s] %(message)s',
+                    datefmt='%H:%M:%S')
+_logger = logging.getLogger(__name__)
+
+
+class RankLoggerAdapter(logging.LoggerAdapter):
+    """Logger adapter that includes rank information."""
+    def process(self, msg, kwargs):
+        kwargs.setdefault('extra', {})['rank'] = self.extra.get('rank', '?')
+        return msg, kwargs
+
+
+def get_logger(rank: int = -1):
+    """Get a logger with rank information."""
+    return RankLoggerAdapter(_logger, {'rank': rank})
 
 
 @triton.jit(do_not_specialize=["rank"])
@@ -348,30 +367,41 @@ class AllGatherGEMMTensorParallelContext:
     for_correctness: bool = False
 
     def __post_init__(self):
+        log = get_logger(self.rank)
+        log.info(f"[__post_init__] Starting initialization: num_ranks={self.num_ranks}, num_local_ranks={self.num_local_ranks}")
+
         assert self.num_ranks % self.num_local_ranks == 0
         self.is_multinode = self.num_ranks > self.num_local_ranks
         self.n_nodes = self.num_ranks // self.num_local_ranks
         self.node_rank = self.rank // self.num_local_ranks
         self.local_rank = self.rank % self.num_local_ranks
+        log.info(f"[__post_init__] is_multinode={self.is_multinode}, local_rank={self.local_rank}")
 
         # create symmetric workspace from pytorch symmetric memory
-
+        log.info(f"[__post_init__] Creating symm_workspaces: shape=({self.max_M}, {self.K}), dtype={self.tensor_dtype}")
         self.symm_workspaces = ishmem_create_tensors((self.max_M, self.K), self.tensor_dtype, self.rank,
                                                       self.num_local_ranks)
         self.symm_workspace = self.symm_workspaces[self.local_rank]
+        log.info(f"[__post_init__] symm_workspaces created successfully, got {len(self.symm_workspaces)} tensors")
 
-        self.symm_comm_buf = ishmem_create_tensors((3 * self.num_ranks, ), torch.int32)
+        log.info(f"[__post_init__] Creating symm_comm_buf: shape=({3 * self.num_ranks},)")
+        self.symm_comm_buf = ishmem_create_tensors((3 * self.num_ranks, ), torch.int32, self.rank, self.num_local_ranks)
+        self.symm_comm_buf = self.symm_comm_buf[self.local_rank]
         self.symm_comm_buf.fill_(0)
+        log.info(f"[__post_init__] symm_comm_buf created successfully")
 
         barrier_dtype = NVSHMEM_SIGNAL_DTYPE if self.is_multinode else torch.int32
+        log.info(f"[__post_init__] Creating symm_barriers: shape=({self.num_ranks},), dtype={barrier_dtype}")
         self.symm_barriers = ishmem_create_tensors((self.num_ranks, ), barrier_dtype, self.rank, self.num_local_ranks)
         self.symm_barrier = self.symm_barriers[self.local_rank]
         self.symm_barrier.fill_(0)
+        log.info(f"[__post_init__] symm_barriers created successfully")
 
         self.fake_barrier = torch.ones([self.num_ranks], dtype=barrier_dtype, device="xpu")
         self.max_gemm_sm = torch.xpu.get_device_properties("xpu").gpu_eu_count
 
         torch.xpu.synchronize()
+        log.info(f"[__post_init__] Initialization complete")
 
     def finailize(self):
         # Note: On Intel XPU, we use IPC memory which is managed differently
@@ -468,12 +498,17 @@ def ag_gemm(a, b, ctx: AllGatherGEMMTensorParallelContext, persistent=True, auto
 
 def rowise_ag_gemm_dispatcher(a, b, c, ctx: AllGatherGEMMTensorParallelContext, persistent=False, autotune=False,
                               straggler_option=None):
+    log = get_logger(ctx.rank)
+    log.info(f"[rowise_ag_gemm_dispatcher] Starting: a.shape={a.shape}, b.shape={b.shape}, persistent={persistent}")
+
     current_stream = torch.xpu.current_stream()
     if ctx.is_multinode:
         ctx.ag_internode_stream.wait_stream(current_stream)
     ctx.ag_intranode_stream.wait_stream(current_stream)
+    log.info(f"[rowise_ag_gemm_dispatcher] Streams synchronized, starting AllGather")
 
     if not ctx.is_multinode:
+        log.info(f"[rowise_ag_gemm_dispatcher] Calling cp_engine_producer_all_gather_intra_node with method={ctx.all_gather_method}")
         cp_engine_producer_all_gather_intra_node(
             ctx.rank,
             ctx.num_ranks,
@@ -484,25 +519,33 @@ def rowise_ag_gemm_dispatcher(a, b, c, ctx: AllGatherGEMMTensorParallelContext, 
             for_correctness=ctx.for_correctness,
             all_gather_method=ctx.all_gather_method,
         )
+        log.info(f"[rowise_ag_gemm_dispatcher] AllGather completed")
     else:
         raise ValueError(f"Inter-nodes not supported on XPU")
 
-    M_per_rank, K = a.shape
+    M_per_rank, _ = a.shape
     M = M_per_rank * ctx.num_ranks
+    log.info(f"[rowise_ag_gemm_dispatcher] Starting GEMM: M={M}, N={ctx.N_per_rank}, K={ctx.K}")
+
     if not persistent:
         grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(ctx.N_per_rank, META["BLOCK_SIZE_N"]), )
         if not autotune:
+            log.info(f"[rowise_ag_gemm_dispatcher] Launching kernel_consumer_gemm_non_persistent")
             compiled = kernel_consumer_gemm_non_persistent[grid](
                 ctx.symm_workspace[:M], b, c,  #
                 M, ctx.N_per_rank, ctx.K,  #
                 ctx.symm_workspace.stride(0), ctx.symm_workspace.stride(1), b.stride(1), b.stride(0), c.stride(0),
                 c.stride(1), ctx.rank, ctx.num_ranks, ctx.symm_barrier, ctx.BLOCK_M, ctx.BLOCK_N, ctx.BLOCK_K,
                 ctx.GROUP_SIZE_M, num_stages=ctx.stages, num_warps=ctx.warps)
+            log.info(f"[rowise_ag_gemm_dispatcher] GEMM kernel launched")
         else:
             raise ValueError(f"Autotune not supported on XPU")
     else:
         raise ValueError(f"Persistent not supported on XPU")
+
+    log.info(f"[rowise_ag_gemm_dispatcher] Waiting for intranode stream")
     current_stream.wait_stream(ctx.ag_intranode_stream)
+    log.info(f"[rowise_ag_gemm_dispatcher] Completed")
 
     return compiled
 

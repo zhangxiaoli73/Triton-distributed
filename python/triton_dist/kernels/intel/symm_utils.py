@@ -27,6 +27,20 @@ from torch._C._distributed_c10d import _SymmetricMemory
 
 # Some code from python/flux/util.py in flux project
 
+# Setup logging for debugging
+_log_level = os.environ.get("TRITON_DIST_LOG_LEVEL", "WARNING").upper()
+_logger = logging.getLogger(__name__)
+
+
+def get_symm_logger(rank: int = -1):
+    """Get a logger with rank information for symm_utils."""
+    class RankAdapter(logging.LoggerAdapter):
+        def process(self, msg, kwargs):
+            kwargs.setdefault('extra', {})['rank'] = self.extra.get('rank', '?')
+            return msg, kwargs
+    return RankAdapter(_logger, {'rank': rank})
+
+
 _TP_GROUP = None
 _group_name_to_workspace_tensor: dict[str, torch.Tensor | None] = {}
 
@@ -49,15 +63,24 @@ def ishmem_create_tensor(shape, dtype) -> torch.Tensor:
     torch.xpu.synchronize()
     return tensor
 
-def create_symmetric_handle(shape, dtype, group_name) -> _SymmetricMemory:
+def create_symmetric_handle(shape, dtype, group_name, rank=-1) -> _SymmetricMemory:
+    log = get_symm_logger(rank)
+    log.info(f"[create_symmetric_handle] Starting: shape={shape}, dtype={dtype}, group_name={group_name}")
+
+    log.info(f"[create_symmetric_handle] Enabling symm_mem for group")
     enable_symm_mem_for_group(group_name)
+    log.info(f"[create_symmetric_handle] symm_mem enabled")
+
     tensor = _group_name_to_workspace_tensor.get(group_name)
     size = tensor.numel() * tensor.element_size() if tensor is not None else 0
     req_size = 1
     for s in shape:
         req_size *= s
     req_size *= torch.empty([], dtype=dtype).element_size()
+    log.info(f"[create_symmetric_handle] existing_size={size}, required_size={req_size}")
+
     if tensor is None or size < req_size:
+        log.info(f"[create_symmetric_handle] Creating new _SymmetricMemory.empty_strided_p2p tensor")
         # need calculate stride ?
         tensor = _SymmetricMemory.empty_strided_p2p(
             shape,
@@ -67,18 +90,37 @@ def create_symmetric_handle(shape, dtype, group_name) -> _SymmetricMemory:
             group_name,
         )
         _group_name_to_workspace_tensor[group_name] = tensor
-    return _SymmetricMemory.rendezvous(tensor)
+        log.info(f"[create_symmetric_handle] New tensor created and stored")
+    else:
+        log.info(f"[create_symmetric_handle] Reusing existing tensor")
+
+    log.info(f"[create_symmetric_handle] Calling _SymmetricMemory.rendezvous")
+    result = _SymmetricMemory.rendezvous(tensor)
+    log.info(f"[create_symmetric_handle] rendezvous completed")
+    return result
+
 
 def get_remote_tensors(local_sm_handle, local_tensor, rank, local_world_size) -> List[torch.Tensor]:
+    log = get_symm_logger(rank)
+    log.info(f"[get_remote_tensors] Starting: rank={rank}, local_world_size={local_world_size}, tensor_shape={local_tensor.shape}")
+
     def _get_peer_tensor(t, peer) -> torch.Tensor:
         if peer == rank:
+            log.info(f"[get_remote_tensors] Peer {peer} is self, returning local tensor")
             return t
-        return local_sm_handle.get_buffer(peer, tuple(t.size()), t.dtype)
+        log.info(f"[get_remote_tensors] Getting buffer for peer {peer}")
+        result = local_sm_handle.get_buffer(peer, tuple(t.size()), t.dtype)
+        log.info(f"[get_remote_tensors] Got buffer for peer {peer}")
+        return result
 
     local_rank = rank % local_world_size
     rank_on_same_node_start = rank - local_rank
     rank_on_same_node_end = rank_on_same_node_start + local_world_size
-    return [_get_peer_tensor(local_tensor, peer) for peer in range(rank_on_same_node_start, rank_on_same_node_end)]
+    log.info(f"[get_remote_tensors] Fetching tensors from peers {rank_on_same_node_start} to {rank_on_same_node_end}")
+
+    result = [_get_peer_tensor(local_tensor, peer) for peer in range(rank_on_same_node_start, rank_on_same_node_end)]
+    log.info(f"[get_remote_tensors] Got {len(result)} tensors")
+    return result
 
 def ishmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.Tensor]:
     """
@@ -91,14 +133,28 @@ def ishmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.Te
     For now, this creates local tensors. Proper IPC sharing needs to be
     implemented based on the Intel XPU runtime capabilities.
     """
+    log = get_symm_logger(rank)
+    log.info(f"[ishmem_create_tensors] Starting: shape={shape}, dtype={dtype}, rank={rank}, local_world_size={local_world_size}")
+
     local_rank = rank % local_world_size
+    log.info(f"[ishmem_create_tensors] local_rank={local_rank}")
+
     torch.xpu.synchronize()
+    log.info(f"[ishmem_create_tensors] XPU synchronized")
 
     # Create a list of tensors (placeholder - each rank creates its own), WA with pytorch symmetric memory
-
+    log.info(f"[ishmem_create_tensors] Creating new distributed group with ranks={list(range(local_world_size))}")
     gp = torch.distributed.new_group(ranks=list(range(local_world_size)), backend="xccl")
-    symm_handle = create_symmetric_handle(shape, dtype, gp.group_name)
-    symm_comm = get_remote_tensors(symm_handle, _group_name_to_workspace_tensor[symm_handle], rank, local_world_size)
+    log.info(f"[ishmem_create_tensors] Group created: group_name={gp.group_name}")
+
+    log.info(f"[ishmem_create_tensors] Creating symmetric handle")
+    symm_handle = create_symmetric_handle(shape, dtype, gp.group_name, rank)
+    log.info(f"[ishmem_create_tensors] Symmetric handle created")
+
+    log.info(f"[ishmem_create_tensors] Getting remote tensors")
+    symm_comm = get_remote_tensors(symm_handle, _group_name_to_workspace_tensor[gp.group_name], rank, local_world_size)
+    log.info(f"[ishmem_create_tensors] Got {len(symm_comm)} remote tensors")
+
     return symm_comm
 
 
@@ -146,7 +202,7 @@ def initialize_distributed(seed=None) -> torch.distributed.ProcessGroup:
 
     # Set Intel XPU device
     torch.xpu.set_device(LOCAL_RANK)
-
+    print(f"[rank={LOCAL_RANK}] zl_debug: start to init_process_group \n")
     torch.distributed.init_process_group(
         backend="cpu:gloo,xpu:xccl",  # Use CCL for Intel XPU
         world_size=WORLD_SIZE,
@@ -157,13 +213,14 @@ def initialize_distributed(seed=None) -> torch.distributed.ProcessGroup:
 
     # Use CCL backend for Intel XPU tensor parallelism
     _TP_GROUP = torch.distributed.new_group(ranks=list(range(WORLD_SIZE)), backend="xccl")
-    torch.distributed.barrier(_TP_GROUP)
+    # torch.distributed.barrier(_TP_GROUP)
 
     _TP_GROUP_GLOO = torch.distributed.new_group(ranks=list(range(WORLD_SIZE)), backend="gloo")
-    torch.distributed.barrier(_TP_GROUP_GLOO)
+    # torch.distributed.barrier(_TP_GROUP_GLOO)
 
     init_seed(seed=seed if seed is not None else RANK)
     # Note: NVSHMEM is not available on Intel XPU, IPC sharing handled differently
+    print(f"[rank={LOCAL_RANK}] zl_debug: initialize_distributed done \n")
     return _TP_GROUP
 
 

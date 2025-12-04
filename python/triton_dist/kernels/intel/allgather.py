@@ -11,6 +11,8 @@ Key differences from NVIDIA version:
 """
 
 import functools
+import logging
+import os
 import time
 from enum import Enum
 from typing import List, Optional
@@ -18,6 +20,22 @@ from typing import List, Optional
 import torch
 
 from triton_dist.kernels.intel.common_ops import _set_signal_xpu, _wait_eq_xpu
+
+# Setup logging for debugging
+_log_level = os.environ.get("TRITON_DIST_LOG_LEVEL", "WARNING").upper()
+_logger = logging.getLogger(__name__)
+
+
+class RankLoggerAdapter(logging.LoggerAdapter):
+    """Logger adapter that includes rank information."""
+    def process(self, msg, kwargs):
+        kwargs.setdefault('extra', {})['rank'] = self.extra.get('rank', '?')
+        return msg, kwargs
+
+
+def get_logger(rank: int = -1):
+    """Get a logger with rank information."""
+    return RankLoggerAdapter(_logger, {'rank': rank})
 
 
 class AllGatherMethod(Enum):
@@ -117,7 +135,10 @@ def cp_engine_producer_all_gather_full_mesh_pull(
 
     Each rank pulls data from all other ranks' buffers to its own buffer.
     """
-    M_per_rank, N = local_tensor.shape
+    log = get_logger(rank)
+    log.info(f"[full_mesh_pull] Starting: num_ranks={num_ranks}, tensor_shape={local_tensor.shape}")
+
+    M_per_rank, _ = local_tensor.shape
     rank_orders = [(rank + i) % num_ranks for i in range(num_ranks)]
 
     with torch.xpu.stream(stream):
@@ -125,14 +146,18 @@ def cp_engine_producer_all_gather_full_mesh_pull(
             # fake a slow communication case
             # test if the computation is waiting for the correct communication
             _add_noise_workload_debug()
-        for src_rank in rank_orders:
+        for idx, src_rank in enumerate(rank_orders):
             if src_rank == rank:
+                log.info(f"[full_mesh_pull] Skipping self (src_rank={src_rank})")
                 continue
+            log.info(f"[full_mesh_pull] Copying from rank {src_rank} ({idx+1}/{num_ranks})")
             dst = remote_tensor_buffers[rank][src_rank * M_per_rank:(src_rank + 1) * M_per_rank, :]
             src = remote_tensor_buffers[src_rank][src_rank * M_per_rank:(src_rank + 1) * M_per_rank, :]
             dst.copy_(src)
             # Set signal to indicate data is ready
             barrier_buffers[rank][src_rank].fill_(1)
+            log.info(f"[full_mesh_pull] Copied from rank {src_rank}, barrier set")
+    log.info(f"[full_mesh_pull] Completed")
 
 
 def cp_engine_producer_all_gather_ring_push_1d(
@@ -149,24 +174,39 @@ def cp_engine_producer_all_gather_ring_push_1d(
 
     Each rank passes data to the next rank in a ring pattern.
     """
+    log = get_logger(rank)
+    log.info(f"[ring_push_1d] Starting: num_ranks={num_ranks}, tensor_shape={local_tensor.shape}")
+
+    poll_count = [0]  # Use list for mutable in closure
+
     def wait_ready(rank: int, segment: int):
         """Wait for a segment to be ready (polling-based with proper sync)."""
+        log.info(f"[ring_push_1d] wait_ready: waiting for rank={rank}, segment={segment}")
         # 必须同步当前 stream，确保能看到其他 GPU 的写入
         torch.xpu.synchronize()
+        poll_count[0] = 0
         while barrier_buffers[rank][segment].item() != 1:
+            poll_count[0] += 1
+            if poll_count[0] % 10000 == 0:
+                log.warning(f"[ring_push_1d] wait_ready: STILL waiting for rank={rank}, segment={segment}, poll_count={poll_count[0]}, barrier_value={barrier_buffers[rank][segment].item()}")
             # 添加小延迟避免过度轮询
             time.sleep(0.0001)
             torch.xpu.synchronize()  # 刷新缓存，重新读取
+        log.info(f"[ring_push_1d] wait_ready: ready! rank={rank}, segment={segment}, poll_count={poll_count[0]}")
 
     def set_ready(rank: int, segment: int):
         """Set a segment as ready with proper synchronization."""
+        log.info(f"[ring_push_1d] set_ready: setting rank={rank}, segment={segment}")
         # 确保之前的 copy 操作完成
         torch.xpu.synchronize()
         barrier_buffers[rank][segment].fill_(1)
         torch.xpu.synchronize()  # 确保信号写入完成
+        log.info(f"[ring_push_1d] set_ready: done rank={rank}, segment={segment}")
 
-    M_per_rank, N = local_tensor.shape
+    M_per_rank, _ = local_tensor.shape
     to_rank = (rank - 1 + num_ranks) % num_ranks
+    log.info(f"[ring_push_1d] to_rank={to_rank}, M_per_rank={M_per_rank}")
+
     with torch.xpu.stream(stream):
         if for_correctness:
             # fake a slow communication case
@@ -177,12 +217,17 @@ def cp_engine_producer_all_gather_ring_push_1d(
             send_segment = (rank + stage) % num_ranks
             M_start = send_segment * M_per_rank
             M_end = M_start + M_per_rank
+            log.info(f"[ring_push_1d] Stage {stage}/{num_ranks-1}: send_segment={send_segment}, M_range=[{M_start}, {M_end})")
             if stage != 0:
                 wait_ready(rank, send_segment)
+            log.info(f"[ring_push_1d] Stage {stage}: copying data to rank {to_rank}")
             dst = remote_tensor_buffers[to_rank][M_start:M_end, :]
             src = remote_tensor_buffers[rank][M_start:M_end, :]
             dst.copy_(src)
             set_ready(to_rank, send_segment)
+            log.info(f"[ring_push_1d] Stage {stage}: completed")
+    log.info(f"[ring_push_1d] All stages completed")
+
 
 def cp_engine_producer_all_gather_intra_node(
     rank: int,
@@ -199,13 +244,20 @@ def cp_engine_producer_all_gather_intra_node(
 
     Selects the appropriate AllGather implementation based on the method.
     """
+    log = get_logger(rank)
+    log.info(f"[intra_node] Starting: method={all_gather_method}, num_ranks={num_ranks}, tensor_shape={local_tensor.shape}")
+    log.info(f"[intra_node] remote_tensor_buffers count={len(remote_tensor_buffers)}, barrier_buffers count={len(barrier_buffers)}")
+
     if all_gather_method == AllGatherMethod.All2All_IntraNode:
         fn = cp_engine_producer_all_gather_full_mesh_pull
+        log.info(f"[intra_node] Using full_mesh_pull")
     elif all_gather_method == AllGatherMethod.Ring1D_IntraNode:
         fn = cp_engine_producer_all_gather_ring_push_1d
+        log.info(f"[intra_node] Using ring_push_1d")
     else:
         raise Exception(f"Unsupported allgather method: {all_gather_method}")
 
+    log.info(f"[intra_node] Calling AllGather function")
     fn(
         rank,
         num_ranks,
@@ -215,6 +267,7 @@ def cp_engine_producer_all_gather_intra_node(
         stream,
         for_correctness=for_correctness,
     )
+    log.info(f"[intra_node] AllGather function completed")
 
 
 def cp_engine_producer_all_gather_ring_push_2d_inter_node(

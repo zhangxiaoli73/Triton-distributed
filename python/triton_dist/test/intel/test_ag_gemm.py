@@ -7,7 +7,7 @@ import torch
 from triton_dist.autotuner import contextual_autotune
 from triton_dist.kernels.intel.allgather_gemm import ag_gemm, create_ag_gemm_context
 from triton_dist.utils import (assert_allclose, group_profile)
-from triton_dist.kernels.intel import initialize_distributed
+from triton_dist.kernels.intel.symm_utils import initialize_distributed
 
 ALL_TESTS = {}
 
@@ -54,6 +54,9 @@ def test_ag_gemm(args, autotune=False):
     N = 5120
     K = 1024
 
+    device = "xpu:{}".format(rank)
+    torch.xpu.set_device(rank)
+
     assert M % num_ranks == 0
     assert N % num_ranks == 0
     M_per_rank = M // num_ranks
@@ -63,6 +66,7 @@ def test_ag_gemm(args, autotune=False):
     B = torch.randn([N_per_rank, K], dtype=dtype, device=device)
 
     debug = args.debug
+    print(f"[rank={rank}] zl_debug: start to create ag gemm context \n")
     ctx = create_ag_gemm_context(A, B, rank, num_ranks, num_local_ranks=args.local_world_size, max_M=M,
                                  for_correctness=debug)
     if rank == 0:
@@ -77,8 +81,10 @@ def test_ag_gemm(args, autotune=False):
             A.random_()
             B.random_()
             ctx.symm_workspace[:M].random_()
+            print(f"[rank={rank}] zl_debug: start to call ag_gemm in iteration {i} \n")
             C = func()
 
+    print(f"[rank={rank}] zl_debug: start to call reference \n")
     ag_A = torch.empty([M, K], dtype=dtype, device=device)
     torch.distributed.all_gather_into_tensor(
         ag_A,
@@ -86,6 +92,7 @@ def test_ag_gemm(args, autotune=False):
         group=args.default_group,
     )
     C_golden = torch.matmul(ag_A, B.T)
+    print(f"[rank={rank}] zl_debug: start to compare results \n")
     for i in range(num_ranks):
         torch.distributed.barrier(args.default_group)
         if rank == i:
