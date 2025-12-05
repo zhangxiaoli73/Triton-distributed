@@ -102,7 +102,7 @@ def copy_and_barrier_all_intra_node_kernel(
     Note: use_cooperative is ignored on Intel (always False behavior)
     """
     # Pre-copy barrier: ensure all ranks are ready
-    barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_sync_ptrs, flag_value, use_cooperative)
+    # barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_sync_ptrs, flag_value, use_cooperative)
 
     # Copy local data to global buffer
     copy_kernel(rank, local_buf_ptr, global_buf_ptr, M_per_rank, N, stride_local_m, stride_local_n, stride_global_m,
@@ -119,7 +119,7 @@ def copy_and_barrier_all_intra_node_kernel(
                 tl.store(symm_barrier_ptr + i, 0)
 
     # Post-copy barrier: ensure all ranks have completed copy
-    barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_sync_ptrs, flag_value + 1, use_cooperative)
+    # barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_sync_ptrs, flag_value + 1, use_cooperative)
 
 
 def local_copy_and_barrier_all(local_rank, rank, num_ranks, local_data, global_data, comm_buf, barrier_ptr, M_per_rank,
@@ -487,8 +487,11 @@ def ag_gemm(a, b, ctx: AllGatherGEMMTensorParallelContext, persistent=True, auto
 
     C = torch.empty([ctx.num_ranks * M_per_rank, N_per_rank], dtype=a.dtype, device=a.device)
 
+    torch.distributed.barrier()
     local_copy_and_barrier_all(ctx.local_rank, ctx.rank, ctx.num_ranks, a, ctx.symm_workspace, ctx.symm_comm_buf,
                                ctx.symm_barrier, M_per_rank, K, ctx.phase, is_internode=ctx.is_multinode)
+    torch.distributed.barrier()
+
     ctx.phase += 2
 
     rowise_ag_gemm_dispatcher(a, b, C, ctx, persistent=persistent, autotune=autotune, straggler_option=straggler_option)
