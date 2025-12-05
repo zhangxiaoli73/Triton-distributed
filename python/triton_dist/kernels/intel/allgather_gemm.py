@@ -1,6 +1,7 @@
 import logging
 import os
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -79,6 +80,7 @@ def copy_and_barrier_all_intra_node_kernel(
     global_buf_ptr,
     symm_barrier_ptr,
     symm_sync_ptrs,
+    grid_barrier_ptr,
     M_per_rank,
     N,
     stride_local_m,
@@ -99,10 +101,13 @@ def copy_and_barrier_all_intra_node_kernel(
     3. Sets the symm_barrier signal
     4. Performs another barrier after copy
 
+    Args:
+        grid_barrier_ptr: Pointer to int32 used for grid-wide barrier (sync all work-groups)
+
     Note: use_cooperative is ignored on Intel (always False behavior)
     """
     # Pre-copy barrier: ensure all ranks are ready
-    # barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_sync_ptrs, flag_value, use_cooperative)
+    barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_sync_ptrs, grid_barrier_ptr, flag_value, use_cooperative)
 
     # Copy local data to global buffer
     copy_kernel(rank, local_buf_ptr, global_buf_ptr, M_per_rank, N, stride_local_m, stride_local_n, stride_global_m,
@@ -111,19 +116,16 @@ def copy_and_barrier_all_intra_node_kernel(
     # Set symm barrier signal - only first work-group does this
     pid = tl.program_id(axis=0)
     if pid == 0:
-        # Set barrier_ptr[rank] = 1, others = 0
-        for i in range(num_ranks):
-            if i == rank:
-                tl.store(symm_barrier_ptr + i, 1)
-            else:
-                tl.store(symm_barrier_ptr + i, 0)
+        # Set barrier_ptr[rank] = 1 to indicate this rank's data is ready
+        # Note: Do NOT reset other ranks' barriers - they are set by AllGather
+        tl.store(symm_barrier_ptr + rank, 1)
 
     # Post-copy barrier: ensure all ranks have completed copy
-    # barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_sync_ptrs, flag_value + 1, use_cooperative)
+    barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_sync_ptrs, grid_barrier_ptr, flag_value + 1, use_cooperative)
 
 
-def local_copy_and_barrier_all(local_rank, rank, num_ranks, local_data, global_data, comm_buf, barrier_ptr, M_per_rank,
-                               N, phase, is_internode: bool = False, use_cooperative: bool = False):
+def local_copy_and_barrier_all(local_rank, rank, num_ranks, local_data, global_data, comm_buf_ptrs, grid_barrier,
+                               barrier_ptr, M_per_rank, N, phase, is_internode: bool = False, use_cooperative: bool = False):
     """
     Intel XPU implementation of local copy with barrier synchronization.
 
@@ -133,7 +135,8 @@ def local_copy_and_barrier_all(local_rank, rank, num_ranks, local_data, global_d
         num_ranks: Total number of ranks
         local_data: Source tensor to copy
         global_data: Destination tensor (symmetric workspace)
-        comm_buf: IPC memory pointers for barrier synchronization
+        comm_buf_ptrs: Int64 tensor containing data_ptr() for each rank's IPC comm buffer
+        grid_barrier: Int32 tensor for grid-wide barrier synchronization
         barrier_ptr: Barrier signal buffer
         M_per_rank: Rows per rank
         N: Number of columns
@@ -150,7 +153,8 @@ def local_copy_and_barrier_all(local_rank, rank, num_ranks, local_data, global_d
         CPY_BLOCKS = [128, 256]
 
         copy_and_barrier_all_intra_node_kernel[grid](local_rank, rank, num_ranks, local_data,
-                                                     global_data, barrier_ptr, comm_buf, M_per_rank, N,
+                                                     global_data, barrier_ptr, comm_buf_ptrs, grid_barrier,
+                                                     M_per_rank, N,
                                                      local_data.stride(0), local_data.stride(1), global_data.stride(0),
                                                      global_data.stride(1), phase, CPY_BLOCKS[0], CPY_BLOCKS[1],
                                                      use_cooperative, **additional_options)
@@ -348,6 +352,8 @@ class AllGatherGEMMTensorParallelContext:
     symm_barrier: torch.Tensor = field(init=False)
     fake_barrier: torch.Tensor = field(init=False)  # for gemm only function
     symm_comm_buf: torch.Tensor = field(init=False)
+    symm_comm_buf_ptrs: torch.Tensor = field(init=False)  # int64 tensor of data_ptr() for each rank's comm buffer
+    grid_barrier: torch.Tensor = field(init=False)  # int32 tensor for grid-wide barrier
     barrier_target = 1
     # async streams (Intel XPU streams)
     ag_intranode_stream: Optional[torch.xpu.Stream] = None
@@ -385,10 +391,19 @@ class AllGatherGEMMTensorParallelContext:
         log.info(f"[__post_init__] symm_workspaces created successfully, got {len(self.symm_workspaces)} tensors")
 
         log.info(f"[__post_init__] Creating symm_comm_buf: shape=({3 * self.num_ranks},)")
-        self.symm_comm_buf = ishmem_create_tensors((3 * self.num_ranks, ), torch.int32, self.rank, self.num_local_ranks)
-        self.symm_comm_buf = self.symm_comm_buf[self.local_rank]
+        symm_comm_bufs = ishmem_create_tensors((3 * self.num_ranks, ), torch.int32, self.rank, self.num_local_ranks)
+        self.symm_comm_buf = symm_comm_bufs[self.local_rank]
         self.symm_comm_buf.fill_(0)
-        log.info(f"[__post_init__] symm_comm_buf created successfully")
+        # Create pointer array for kernel to access all ranks' comm buffers via IPC
+        # Note: Use uint64 to avoid overflow with large pointer addresses on XPU,
+        # and create on CPU first before moving to XPU to avoid direct conversion issues
+        comm_buf_ptr_values = np.array([buf.data_ptr() for buf in symm_comm_bufs], dtype=np.uint64)
+        self.symm_comm_buf_ptrs = torch.from_numpy(comm_buf_ptr_values).to(device="xpu")
+        log.info(f"[__post_init__] symm_comm_buf created, ptrs={[hex(p) for p in self.symm_comm_buf_ptrs.tolist()]}")
+
+        # Grid barrier - single int32 for synchronizing all work-groups within a kernel
+        self.grid_barrier = torch.zeros(1, dtype=torch.int32, device="xpu")
+        log.info(f"[__post_init__] grid_barrier created")
 
         barrier_dtype = NVSHMEM_SIGNAL_DTYPE if self.is_multinode else torch.int32
         log.info(f"[__post_init__] Creating symm_barriers: shape=({self.num_ranks},), dtype={barrier_dtype}")
@@ -487,11 +502,8 @@ def ag_gemm(a, b, ctx: AllGatherGEMMTensorParallelContext, persistent=True, auto
 
     C = torch.empty([ctx.num_ranks * M_per_rank, N_per_rank], dtype=a.dtype, device=a.device)
 
-    torch.distributed.barrier()
-    local_copy_and_barrier_all(ctx.local_rank, ctx.rank, ctx.num_ranks, a, ctx.symm_workspace, ctx.symm_comm_buf,
-                               ctx.symm_barrier, M_per_rank, K, ctx.phase, is_internode=ctx.is_multinode)
-    torch.distributed.barrier()
-
+    local_copy_and_barrier_all(ctx.local_rank, ctx.rank, ctx.num_ranks, a, ctx.symm_workspace, ctx.symm_comm_buf_ptrs,
+                               ctx.grid_barrier, ctx.symm_barrier, M_per_rank, K, ctx.phase, is_internode=ctx.is_multinode)
     ctx.phase += 2
 
     rowise_ag_gemm_dispatcher(a, b, C, ctx, persistent=persistent, autotune=autotune, straggler_option=straggler_option)

@@ -31,6 +31,13 @@ def _is_gpu_master():
 
 
 @triton.jit
+def _get_high_bit_u32():
+    """Helper to get 0x80000000 as uint32 without overflow."""
+    # -2147483648 in signed int32 equals 0x80000000 in unsigned
+    return tl.cast(-2147483648, tl.int32).to(tl.uint32, bitcast=True)
+
+
+@triton.jit
 def unsafe_barrier_on_this_grid(ptr):
     """
     Intel SYCL implementation of grid-wide barrier using atomic operations.
@@ -46,17 +53,21 @@ def unsafe_barrier_on_this_grid(ptr):
     expected = pid_size_x * pid_size_y * pid_size_z
 
     # Use atomic add for arrival counting
+    # Note: Use helper function to get 0x80000000 as uint32 to avoid overflow
+    high_bit_u32 = _get_high_bit_u32()
     if _is_gpu_master():
-        nb = tl.cast(0x80000000, tl.uint32, bitcast=True) - (expected - 1)
+        nb = high_bit_u32 - tl.cast(expected - 1, tl.uint32)
     else:
         nb = tl.cast(1, tl.uint32)
 
     old_arrive = tl.atomic_add(ptr, nb, sem="release", scope="gpu")
 
     # Wait for all work-groups to arrive
-    current_arrive = tl.load(ptr)
-    while ((old_arrive ^ current_arrive) & 0x80000000) == 0:
-        current_arrive = tl.load(ptr)
+    # Use atomic add with 0 to force memory read (volatile semantics)
+    current_arrive = tl.atomic_add(ptr, 0, sem="acquire")
+    # Use high bit for comparison
+    while ((old_arrive ^ current_arrive) & high_bit_u32) == 0:
+        current_arrive = tl.atomic_add(ptr, 0, sem="acquire")
 
     tl.debug_barrier()
 
@@ -75,6 +86,15 @@ def barrier_on_this_grid(ptr, use_cooperative: tl.constexpr):
 
 
 @triton.jit
+def _volatile_load_int32(ptr):
+    """
+    Volatile load for int32 using atomic operation.
+    Atomic add with 0 forces a memory read without caching.
+    """
+    return tl.atomic_add(ptr, 0, sem="acquire")
+
+
+@triton.jit
 def wait_signal(signal_ptr, expected_value):
     """
     Wait for a signal to reach the expected value.
@@ -86,7 +106,8 @@ def wait_signal(signal_ptr, expected_value):
         signal_ptr: Pointer to the signal value
         expected_value: The value to wait for
     """
-    while tl.load(signal_ptr) < expected_value:
+    # Use atomic add with 0 to force memory read (volatile semantics)
+    while _volatile_load_int32(signal_ptr) < expected_value:
         pass
 
 
@@ -104,7 +125,8 @@ def wait_signal_range(signal_ptr, start_idx, count, expected_value):
         expected_value: The value to wait for
     """
     for i in range(count):
-        while tl.load(signal_ptr + start_idx + i) < expected_value:
+        # Use atomic add with 0 to force memory read (volatile semantics)
+        while _volatile_load_int32(signal_ptr + start_idx + i) < expected_value:
             pass
 
 
@@ -139,7 +161,7 @@ def barrier_all_intra_node_atomic_cas_block(local_rank, rank, local_world_size, 
 
 
 @triton.jit
-def _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, local_world_size, symm_flag_ptrs, target_value):
+def _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, local_world_size, symm_flag_ptrs, flag_offset, target_value):
     """
     Intel SYCL implementation of non-atomic barrier (single phase).
 
@@ -149,23 +171,34 @@ def _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, local_world_
         local_rank: Local rank within the node
         rank: Global rank
         local_world_size: Number of ranks on this node
-        symm_flag_ptrs: Pointer to array of IPC memory pointers for each rank
+        symm_flag_ptrs: Int64 pointer to array containing data_ptr() for each rank's IPC buffer
+        flag_offset: Offset into each rank's buffer (for multi-phase barriers)
         target_value: The synchronization value to use
+
+    Memory layout for each rank's buffer:
+        [0, local_world_size): phase 1 flags
+        [local_world_size, 2*local_world_size): phase 2 flags
+        [2*local_world_size, 3*local_world_size): reserved for grid barrier
     """
     # Each rank writes target_value to its slot in all other ranks' buffers
     for i in range(local_world_size):
-        remote_base_ptr = tl.load(symm_flag_ptrs + i).to(tl.int64).to(tl.pointer_type(tl.int32))
-        # Write our target_value to remote_ptr[local_rank]
-        tl.store(remote_base_ptr + local_rank, target_value)
+        # Load the data_ptr (int64) for rank i's buffer
+        remote_ptr_val = tl.load(symm_flag_ptrs + i)
+        # Convert to pointer type: int64 -> pointer to int32
+        remote_base_ptr = remote_ptr_val.to(tl.pointer_type(tl.int32), bitcast=True)
+        # Write our target_value to remote_ptr[flag_offset + local_rank]
+        tl.store(remote_base_ptr + flag_offset + local_rank, target_value)
 
     # Memory fence to ensure stores are visible
     tl.debug_barrier()
 
     # Wait for all other ranks to write their target_value to our buffer
-    local_base_ptr = tl.load(symm_flag_ptrs + local_rank).to(tl.int64).to(tl.pointer_type(tl.int32))
+    local_ptr_val = tl.load(symm_flag_ptrs + local_rank)
+    local_base_ptr = local_ptr_val.to(tl.pointer_type(tl.int32), bitcast=True)
     for i in range(local_world_size):
-        # Spin until we see target_value from rank i
-        while tl.load(local_base_ptr + i) != target_value:
+        # Spin until we see target_value from rank i at our buffer[flag_offset + i]
+        # Use atomic add with 0 to force memory read (volatile semantics)
+        while tl.atomic_add(local_base_ptr + flag_offset + i, 0, sem="acquire") != target_value:
             pass
 
     tl.debug_barrier()
@@ -180,19 +213,19 @@ def barrier_all_intra_node_non_atomic_block(local_rank, rank, num_ranks, symm_fl
         local_rank: Local rank within the node
         rank: Global rank
         num_ranks: Number of ranks on this node
-        symm_flag_ptrs: Pointer to array of IPC memory pointers
+        symm_flag_ptrs: Int64 pointer to array of data_ptr() for each rank's IPC buffer
         target_value: The synchronization value to use
 
     Note: Uses two phases with separate flag regions to avoid race conditions.
     """
-    # First phase
-    _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, num_ranks, symm_flag_ptrs, target_value)
-    # Second phase uses offset pointers (symm_flag_ptrs + num_ranks points to second set of flags)
-    _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, num_ranks, symm_flag_ptrs + num_ranks, target_value)
+    # First phase: use offset 0 (flags at [0, num_ranks))
+    _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, num_ranks, symm_flag_ptrs, 0, target_value)
+    # Second phase: use offset num_ranks (flags at [num_ranks, 2*num_ranks))
+    _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, num_ranks, symm_flag_ptrs, num_ranks, target_value)
 
 
 @triton.jit(do_not_specialize=["local_rank", "rank", "num_ranks", "target_value"])
-def barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_flag_ptrs, target_value,
+def barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_flag_ptrs, grid_barrier_ptr, target_value,
                                       use_cooperative: tl.constexpr):
     """
     Intel SYCL implementation of non-atomic intra-node barrier.
@@ -205,7 +238,8 @@ def barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_flag_ptr
         local_rank: Local rank within the node
         rank: Global rank
         num_ranks: Number of ranks on this node
-        symm_flag_ptrs: Pointer to array of IPC memory pointers for inter-rank sync
+        symm_flag_ptrs: Int64 pointer to array of data_ptr() for each rank's IPC buffer
+        grid_barrier_ptr: Pointer to int32 used for grid-wide barrier (sync all work-groups)
         target_value: The synchronization value to use
         use_cooperative: Ignored on Intel (cooperative launch not supported)
 
@@ -215,19 +249,19 @@ def barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_flag_ptr
     pid = tl.program_id(axis=0)
 
     # Only first work-group performs inter-rank synchronization
+    # Phase 1: use offset 0 (flags at [0, num_ranks))
     if pid == 0:
-        _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, num_ranks, symm_flag_ptrs, target_value)
+        _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, num_ranks, symm_flag_ptrs, 0, target_value)
 
     # Barrier all work-groups within this rank
-    # Note: We need a separate grid barrier pointer, using offset from symm_flag_ptrs
-    # For Intel, we use a simple atomic-based barrier
-    tl.debug_barrier()  # Intra-workgroup sync first
+    barrier_on_this_grid(grid_barrier_ptr, use_cooperative)
 
-    # Second phase of inter-rank sync
+    # Phase 2: use offset num_ranks (flags at [num_ranks, 2*num_ranks))
     if pid == 0:
-        _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, num_ranks, symm_flag_ptrs + num_ranks, target_value)
+        _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, num_ranks, symm_flag_ptrs, num_ranks, target_value)
 
-    tl.debug_barrier()
+    # Barrier all work-groups again
+    barrier_on_this_grid(grid_barrier_ptr, use_cooperative)
 
 
 # ============================================================================

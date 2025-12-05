@@ -82,7 +82,7 @@ def test_ag_gemm(args, autotune=False):
             # ctx.symm_workspace[:M].random_()
             print(f"[rank={rank}] zl_debug: start to call ag_gemm in iteration {i} \n")
             C = func()
-
+    torch.xpu.synchronize()
     print(f"[rank={rank}] zl_debug: start to call reference \n")
     ag_A = torch.empty([M, K], dtype=dtype, device=device)
     torch.distributed.all_gather_into_tensor(
