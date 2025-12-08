@@ -45,8 +45,6 @@ def unsafe_barrier_on_this_grid(ptr):
     WARNING: This may hang if not all work-groups can run concurrently.
     Intel Triton does not support cooperative grid launch.
     """
-    tl.debug_barrier()  # Work-group level barrier (replaces __syncthreads)
-
     pid_size_x = tl.num_programs(axis=0)
     pid_size_y = tl.num_programs(axis=1)
     pid_size_z = tl.num_programs(axis=2)
@@ -68,8 +66,6 @@ def unsafe_barrier_on_this_grid(ptr):
     # Use high bit for comparison
     while ((old_arrive ^ current_arrive) & high_bit_u32) == 0:
         current_arrive = tl.atomic_add(ptr, 0, sem="acquire")
-
-    tl.debug_barrier()
 
 
 @triton.jit
@@ -157,8 +153,6 @@ def barrier_all_intra_node_atomic_cas_block(local_rank, rank, local_world_size, 
         while tl.atomic_cas(local_base_ptr + i, 1, 0, sem="acquire", scope="sys") != 1:
             pass
 
-    tl.debug_barrier()
-
 
 @triton.jit
 def _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, local_world_size, symm_flag_ptrs, flag_offset, target_value):
@@ -187,10 +181,8 @@ def _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, local_world_
         # Convert to pointer type: int64 -> pointer to int32
         remote_base_ptr = remote_ptr_val.to(tl.pointer_type(tl.int32), bitcast=True)
         # Write our target_value to remote_ptr[flag_offset + local_rank]
-        tl.store(remote_base_ptr + flag_offset + local_rank, target_value)
-
-    # Memory fence to ensure stores are visible
-    tl.debug_barrier()
+        # Use atomic store for memory visibility across ranks
+        tl.atomic_xchg(remote_base_ptr + flag_offset + local_rank, target_value, sem="release")
 
     # Wait for all other ranks to write their target_value to our buffer
     local_ptr_val = tl.load(symm_flag_ptrs + local_rank)
@@ -200,8 +192,6 @@ def _barrier_all_intra_node_non_atomic_once_block(local_rank, rank, local_world_
         # Use atomic add with 0 to force memory read (volatile semantics)
         while tl.atomic_add(local_base_ptr + flag_offset + i, 0, sem="acquire") != target_value:
             pass
-
-    tl.debug_barrier()
 
 
 @triton.jit(do_not_specialize=["local_rank", "rank", "num_ranks", "target_value"])
