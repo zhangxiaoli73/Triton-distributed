@@ -430,6 +430,31 @@ def _wait_eq_xpu(signal_tensor: torch.Tensor, signal: int, stream: Optional[torc
         pass
 
 
+@triton.jit(do_not_specialize=["value"])
+def _fill_single_value_kernel(ptr, value):
+    """
+    Minimal SYCL kernel to fill a single int32 value.
+
+    This kernel uses only 1 work-group (1 EU) to set a single value.
+    More efficient than PyTorch's fill_() for single-element barrier signals.
+    """
+    tl.store(ptr, value)
+
+
+def fill_single_value_xpu(tensor: torch.Tensor, value: int):
+    """
+    Fill a single-element tensor with a value using a minimal SYCL kernel.
+
+    Uses only 1 EU (work-group) for efficiency when setting barrier signals.
+
+    Args:
+        tensor: Single-element tensor to fill (must be int32 or compatible)
+        value: The integer value to set
+    """
+    # Launch with grid=(1,) to use only 1 EU
+    _fill_single_value_kernel[(1,)](tensor, value)
+
+
 def _set_signal_xpu(signal_tensor: torch.Tensor, signal: int, stream: Optional[torch.xpu.Stream] = None):
     """
     Set a signal tensor to a specific value.

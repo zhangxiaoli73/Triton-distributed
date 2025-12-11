@@ -19,7 +19,7 @@ from typing import List, Optional
 
 import torch
 
-from triton_dist.kernels.intel.common_ops import _set_signal_xpu, _wait_eq_xpu
+from triton_dist.kernels.intel.common_ops import _set_signal_xpu, _wait_eq_xpu, fill_single_value_xpu
 
 # Setup logging for debugging
 _log_level = os.environ.get("TRITON_DIST_LOG_LEVEL", "WARNING").upper()
@@ -121,8 +121,8 @@ def cp_engine_producer_all_gather_full_mesh_push(
         for dst_local_rank in push_order:
             dst = remote_tensor_buffers[dst_local_rank][local_rank * M_per_rank:(local_rank + 1) * M_per_rank, :]
             dst.copy_(src)
-            # Set signal to indicate data is ready
-            barrier_buffers[dst_local_rank][local_rank].fill_(1)
+            # Set signal to indicate data is ready using minimal SYCL kernel (1 EU only)
+            fill_single_value_xpu(barrier_buffers[dst_local_rank][local_rank], 1)
 
 
 def cp_engine_producer_all_gather_full_mesh_pull(
@@ -162,8 +162,8 @@ def cp_engine_producer_all_gather_full_mesh_pull(
             dst = remote_tensor_buffers[local_rank][src_local_rank * M_per_rank:(src_local_rank + 1) * M_per_rank, :]
             src = remote_tensor_buffers[src_local_rank][src_local_rank * M_per_rank:(src_local_rank + 1) * M_per_rank, :]
             dst.copy_(src) # pull from remote to local index (peer rank corresponding to local index)
-            # Set signal to indicate data is ready
-            barrier_buffers[local_rank][src_local_rank].fill_(1)
+            # Set signal to indicate data is ready using minimal SYCL kernel (1 EU only)
+            fill_single_value_xpu(barrier_buffers[local_rank][src_local_rank], 1)
             log.info(f"[full_mesh_pull] Copied from local_rank {src_local_rank}, barrier set")
     log.info(f"[full_mesh_pull] Completed")
 
@@ -212,7 +212,8 @@ def cp_engine_producer_all_gather_ring_push_1d(
         log.info(f"[ring_push_1d] set_ready: setting local_rank={local_rank_idx}, segment={segment}")
         # 确保之前的 copy 操作完成
         torch.xpu.synchronize()
-        barrier_buffers[local_rank_idx][segment].fill_(1)
+        # Use minimal SYCL kernel (1 EU only) for setting barrier signal
+        fill_single_value_xpu(barrier_buffers[local_rank_idx][segment], 1)
         torch.xpu.synchronize()  # 确保信号写入完成
         log.info(f"[ring_push_1d] set_ready: done local_rank={local_rank_idx}, segment={segment}")
 
@@ -311,8 +312,8 @@ def cp_engine_producer_all_gather_ring_push_2d_inter_node(
             pass
 
     def set_ready(rank: int, segment: int):
-        """Set a segment as ready."""
-        barrier_buffers[rank][segment].fill_(1)
+        """Set a segment as ready using minimal SYCL kernel (1 EU only)."""
+        fill_single_value_xpu(barrier_buffers[rank][segment], 1)
 
     nnodes = num_ranks // num_local_ranks
     M_per_rank, N = local_tensor.shape

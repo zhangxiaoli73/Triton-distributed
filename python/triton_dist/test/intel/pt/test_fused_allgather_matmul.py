@@ -127,7 +127,7 @@ def test_allgather_matmul(rank, world_size):
     end_events_triton = [torch.xpu.Event(enable_timing=True) for _ in range(Loop-5)]
 
     B_transpose = Bs[0].T
-    ctx = create_ag_gemm_context(A_shard, B_transpose, rank, world_size, num_local_ranks=world_size, max_M=M, for_correctness=False)
+    ctx = create_ag_gemm_context(A_shard, B_transpose, rank, world_size, num_local_ranks=world_size, max_M=M*world_size, for_correctness=False)
     if enable_profile:
         prof = torch.profiler.profile(
             activities=[
@@ -175,7 +175,7 @@ def test_allgather_matmul(rank, world_size):
         # warm up ag_gemm ops
         print(f"zl_debug start to call ag_gemm_triton ", flush=True)
         for i in range(10):
-            ag_output_2, mm_outputs_2 = ag_gemm(
+            mm_outputs_2 = ag_gemm(
                 A_shard, B_transpose, ctx=ctx, persistent=False, autotune=False
             )
         torch.xpu.synchronize()
@@ -183,7 +183,7 @@ def test_allgather_matmul(rank, world_size):
         for i in range(Loop):
             if i >= 5:
                 begin_events_triton[i - 5].record()
-            ag_output_2, mm_outputs_2 = ag_gemm(
+            mm_outputs_2 = ag_gemm(
                 A_shard, B_transpose, ctx=ctx, persistent=False, autotune=False
             )
             if i >= 5:
