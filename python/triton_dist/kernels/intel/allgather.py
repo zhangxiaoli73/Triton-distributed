@@ -19,7 +19,48 @@ from typing import List, Optional
 
 import torch
 
-from triton_dist.kernels.intel.common_ops import _set_signal_xpu, _wait_eq_xpu, fill_single_value_xpu
+from triton_dist.kernels.intel.common_ops import _set_signal_xpu, _wait_eq_xpu
+
+# Constant tensors for barrier signaling using copy engine
+# These are lazily initialized on first use to avoid device initialization issues
+_BARRIER_CONST_TENSORS = {}
+
+
+def _get_barrier_const(value: int, dtype: torch.dtype, device: torch.device, is_scalar: bool = False) -> torch.Tensor:
+    """
+    Get a constant tensor for barrier signaling.
+    Uses copy_ instead of fill_ to leverage the copy engine.
+
+    Args:
+        value: The constant value (0 or 1)
+        dtype: The tensor dtype
+        device: The target device
+        is_scalar: If True, return a scalar tensor (shape []), otherwise shape [1]
+
+    Returns:
+        A tensor with the specified value
+    """
+    key = (value, dtype, device, is_scalar)
+    if key not in _BARRIER_CONST_TENSORS:
+        if is_scalar:
+            _BARRIER_CONST_TENSORS[key] = torch.tensor(value, dtype=dtype, device=device)
+        else:
+            _BARRIER_CONST_TENSORS[key] = torch.tensor([value], dtype=dtype, device=device)
+    return _BARRIER_CONST_TENSORS[key]
+
+
+def _set_barrier(tensor: torch.Tensor, value: int):
+    """
+    Set a barrier tensor to a value using copy engine.
+
+    Args:
+        tensor: The barrier tensor to set
+        value: The value to set (0 or 1)
+    """
+    is_scalar = (tensor.dim() == 0)
+    const_tensor = _get_barrier_const(value, tensor.dtype, tensor.device, is_scalar)
+    tensor.copy_(const_tensor)
+
 
 # Setup logging for debugging
 _log_level = os.environ.get("TRITON_DIST_LOG_LEVEL", "WARNING").upper()
@@ -111,6 +152,10 @@ def cp_engine_producer_all_gather_full_mesh_push(
     Each rank pushes its data to all other ranks' buffers.
 
     Note: remote_tensor_buffers and barrier_buffers are indexed by local_rank (0 to num_ranks-1).
+
+    Barrier semantics for push:
+    - barrier_buffers[dst_local_rank][local_rank] = 1 means dst_local_rank has received data from local_rank
+    - Each rank resets its own barrier buffer (barrier_buffers[local_rank][*]) before pushing
     """
     # For intra-node communication, rank == local_rank since num_ranks == num_local_ranks
     local_rank = rank % num_ranks
@@ -118,11 +163,20 @@ def cp_engine_producer_all_gather_full_mesh_push(
     push_order = [(local_rank + i) % num_ranks for i in range(num_ranks)]
     src = local_tensor
     with torch.xpu.stream(stream):
+        # Reset barriers for this rank before starting AllGather
+        # Note: In push mode, we reset barrier_buffers[local_rank][*] which tracks
+        # what data this rank has received (for GEMM consumer to wait on)
+        # Set self to 1 (own data is always ready), others to 0
+        for i in range(num_ranks):
+            if i == local_rank:
+                _set_barrier(barrier_buffers[local_rank][i], 1)  # Own data is ready
+            else:
+                _set_barrier(barrier_buffers[local_rank][i], 0)  # Reset, will be set by other ranks pushing to us
+
         for dst_local_rank in push_order:
             dst = remote_tensor_buffers[dst_local_rank][local_rank * M_per_rank:(local_rank + 1) * M_per_rank, :]
             dst.copy_(src)
-            # Set signal to indicate data is ready using minimal SYCL kernel (1 EU only)
-            fill_single_value_xpu(barrier_buffers[dst_local_rank][local_rank], 1)
+            _set_barrier(barrier_buffers[dst_local_rank][local_rank], 1)
 
 
 def cp_engine_producer_all_gather_full_mesh_pull(
@@ -150,6 +204,16 @@ def cp_engine_producer_all_gather_full_mesh_pull(
     rank_orders = [(local_rank + i) % num_ranks for i in range(num_ranks)]
 
     with torch.xpu.stream(stream):
+        # Reset all barriers for this rank before starting AllGather
+        # This ensures proper synchronization for multiple iterations
+        # Set self barrier to 1 (own data is always ready), others to 0
+        for i in range(num_ranks):
+            if i == local_rank:
+                _set_barrier(barrier_buffers[local_rank][i], 1)  # Own data is ready
+            else:
+                _set_barrier(barrier_buffers[local_rank][i], 0)  # Reset, will be set after copy
+        log.info(f"[full_mesh_pull] Barriers reset: self=1, others=0")
+
         if for_correctness:
             # fake a slow communication case
             # test if the computation is waiting for the correct communication
@@ -162,8 +226,7 @@ def cp_engine_producer_all_gather_full_mesh_pull(
             dst = remote_tensor_buffers[local_rank][src_local_rank * M_per_rank:(src_local_rank + 1) * M_per_rank, :]
             src = remote_tensor_buffers[src_local_rank][src_local_rank * M_per_rank:(src_local_rank + 1) * M_per_rank, :]
             dst.copy_(src) # pull from remote to local index (peer rank corresponding to local index)
-            # Set signal to indicate data is ready using minimal SYCL kernel (1 EU only)
-            fill_single_value_xpu(barrier_buffers[local_rank][src_local_rank], 1)
+            _set_barrier(barrier_buffers[local_rank][src_local_rank], 1)
             log.info(f"[full_mesh_pull] Copied from local_rank {src_local_rank}, barrier set")
     log.info(f"[full_mesh_pull] Completed")
 
@@ -212,8 +275,7 @@ def cp_engine_producer_all_gather_ring_push_1d(
         log.info(f"[ring_push_1d] set_ready: setting local_rank={local_rank_idx}, segment={segment}")
         # 确保之前的 copy 操作完成
         torch.xpu.synchronize()
-        # Use minimal SYCL kernel (1 EU only) for setting barrier signal
-        fill_single_value_xpu(barrier_buffers[local_rank_idx][segment], 1)
+        _set_barrier(barrier_buffers[local_rank_idx][segment], 1)
         torch.xpu.synchronize()  # 确保信号写入完成
         log.info(f"[ring_push_1d] set_ready: done local_rank={local_rank_idx}, segment={segment}")
 
@@ -222,6 +284,15 @@ def cp_engine_producer_all_gather_ring_push_1d(
     log.info(f"[ring_push_1d] local_rank={local_rank}, to_local_rank={to_local_rank}, M_per_rank={M_per_rank}")
 
     with torch.xpu.stream(stream):
+        # Reset all barriers for this rank before starting AllGather
+        # Set self segment to 1 (own data is always ready), others to 0
+        for i in range(num_ranks):
+            if i == local_rank:
+                _set_barrier(barrier_buffers[local_rank][i], 1)  # Own segment is ready
+            else:
+                _set_barrier(barrier_buffers[local_rank][i], 0)  # Reset, will be set after receiving
+        log.info(f"[ring_push_1d] Barriers reset: self=1, others=0")
+
         if for_correctness:
             # fake a slow communication case
             # test if the computation is waiting for the correct communication
@@ -312,8 +383,8 @@ def cp_engine_producer_all_gather_ring_push_2d_inter_node(
             pass
 
     def set_ready(rank: int, segment: int):
-        """Set a segment as ready using minimal SYCL kernel (1 EU only)."""
-        fill_single_value_xpu(barrier_buffers[rank][segment], 1)
+        """Set a segment as ready."""
+        _set_barrier(barrier_buffers[rank][segment], 1)
 
     nnodes = num_ranks // num_local_ranks
     M_per_rank, N = local_tensor.shape
@@ -322,6 +393,14 @@ def cp_engine_producer_all_gather_ring_push_2d_inter_node(
     to_rank = (local_rank - 1 + num_local_ranks) % num_local_ranks
 
     with torch.xpu.stream(intranode_stream):
+        # Reset all barriers for this rank before starting AllGather
+        # Set self segment to 1 (own data is always ready), others to 0
+        for i in range(num_ranks):
+            if i == rank:
+                _set_barrier(barrier_buffers[local_rank][i], 1)  # Own segment is ready
+            else:
+                _set_barrier(barrier_buffers[local_rank][i], 0)  # Reset, will be set after receiving
+
         if for_correctness:
             _add_noise_workload_debug()
 

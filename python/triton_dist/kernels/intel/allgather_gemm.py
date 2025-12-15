@@ -14,6 +14,39 @@ from triton_dist.kernels.intel.allgather import AllGatherMethod, cp_engine_produ
 from triton_dist.utils import NVSHMEM_SIGNAL_DTYPE, nvshmem_barrier_all_on_stream
 from triton_dist.kernels.intel.symm_utils import ishmem_create_tensors
 
+# Constant tensors for barrier signaling using copy engine
+# These are lazily initialized on first use to avoid device initialization issues
+_BARRIER_CONST_TENSORS = {}
+
+
+def _get_zero_tensor(size: int, dtype: torch.dtype = torch.int32) -> torch.Tensor:
+    """
+    Get a zero tensor for initialization using copy engine.
+
+    Args:
+        size: The size of the tensor
+        dtype: The tensor dtype
+
+    Returns:
+        A tensor filled with zeros
+    """
+    key = (size, dtype)
+    if key not in _BARRIER_CONST_TENSORS:
+        _BARRIER_CONST_TENSORS[key] = torch.zeros(size, dtype=dtype, device="xpu")
+    return _BARRIER_CONST_TENSORS[key]
+
+
+def _zero_tensor_with_copy(tensor: torch.Tensor):
+    """
+    Zero a tensor using copy engine instead of fill_.
+
+    Args:
+        tensor: The tensor to zero
+    """
+    zero_tensor = _get_zero_tensor(tensor.numel(), tensor.dtype)
+    tensor.copy_(zero_tensor)
+
+
 # Setup logging for debugging
 _log_level = os.environ.get("TRITON_DIST_LOG_LEVEL", "WARNING").upper()
 logging.basicConfig(level=getattr(logging, _log_level, logging.WARNING),
@@ -113,12 +146,17 @@ def copy_and_barrier_all_intra_node_kernel(
     copy_kernel(rank, local_buf_ptr, global_buf_ptr, M_per_rank, N, stride_local_m, stride_local_n, stride_global_m,
                 stride_global_n, BLOCK_SIZE_M, BLOCK_SIZE_N)
 
-    # Set symm barrier signal - only first work-group does this
+    # Set symm barrier signal and reset other ranks' barriers
+    # This is done by the first num_ranks threads (similar to NVIDIA version)
     pid = tl.program_id(axis=0)
     if pid == 0:
-        # Set barrier_ptr[rank] = 1 to indicate this rank's data is ready
-        # Note: Do NOT reset other ranks' barriers - they are set by AllGather
-        tl.store(symm_barrier_ptr + rank, 1)
+        # Each rank sets its own barrier to 1 and resets others to 0
+        # This ensures proper reset for the next iteration
+        for i in range(num_ranks):
+            if i == rank:
+                tl.store(symm_barrier_ptr + i, 1)  # This rank's data is ready
+            else:
+                tl.store(symm_barrier_ptr + i, 0)  # Reset other ranks' barriers
 
     # Post-copy barrier: ensure all ranks have completed copy
     barrier_all_intra_node_non_atomic(local_rank, rank, num_ranks, symm_sync_ptrs, grid_barrier_ptr, flag_value + 1, use_cooperative)
@@ -393,7 +431,7 @@ class AllGatherGEMMTensorParallelContext:
         log.info(f"[__post_init__] Creating symm_comm_buf: shape=({3 * self.num_ranks},)")
         symm_comm_bufs = ishmem_create_tensors((3 * self.num_ranks, ), torch.int32, self.rank, self.num_local_ranks)
         self.symm_comm_buf = symm_comm_bufs[self.local_rank]
-        self.symm_comm_buf.fill_(0)
+        _zero_tensor_with_copy(self.symm_comm_buf)  # Use copy engine instead of fill_
         # Create pointer array for kernel to access all ranks' comm buffers via IPC
         # Note: Use uint64 to avoid overflow with large pointer addresses on XPU,
         # and create on CPU first before moving to XPU to avoid direct conversion issues
@@ -409,7 +447,7 @@ class AllGatherGEMMTensorParallelContext:
         log.info(f"[__post_init__] Creating symm_barriers: shape=({self.num_ranks},), dtype={barrier_dtype}")
         self.symm_barriers = ishmem_create_tensors((self.num_ranks, ), barrier_dtype, self.rank, self.num_local_ranks)
         self.symm_barrier = self.symm_barriers[self.local_rank]
-        self.symm_barrier.fill_(0)
+        _zero_tensor_with_copy(self.symm_barrier)  # Use copy engine instead of fill_
         log.info(f"[__post_init__] symm_barriers created successfully")
 
         self.fake_barrier = torch.ones([self.num_ranks], dtype=barrier_dtype, device="xpu")
