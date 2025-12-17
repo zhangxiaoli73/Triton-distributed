@@ -367,6 +367,15 @@ def matmul_get_configs():
         for w in [4, 8]
     ]
 
+
+# Use Triton's autotune to create a wrapper
+# Note: WORLD_SIZE is a tl.constexpr in the kernel, so we must include it in the key
+# to ensure different WORLD_SIZE values get different compiled kernels
+kernel_consumer_gemm_non_persistent_autotune = triton.autotune(
+    configs=matmul_get_configs(),
+    key=["M", "N", "K", "WORLD_SIZE"]
+)(kernel_consumer_gemm_non_persistent)
+
 @dataclass
 class AllGatherGEMMTensorParallelContext:
     # problem size
@@ -592,7 +601,12 @@ def rowise_ag_gemm_dispatcher(a, b, c, ctx: AllGatherGEMMTensorParallelContext, 
                 ctx.GROUP_SIZE_M, num_stages=ctx.stages, num_warps=ctx.warps)
             log.info(f"[rowise_ag_gemm_dispatcher] GEMM kernel launched")
         else:
-            raise ValueError(f"Autotune not supported on XPU")
+            compiled = kernel_consumer_gemm_non_persistent_autotune[grid](
+                ctx.symm_workspace[:M], b, c,  #
+                M, ctx.N_per_rank, ctx.K,  #
+                ctx.symm_workspace.stride(0), ctx.symm_workspace.stride(1), b.stride(1), b.stride(0), c.stride(0),
+                c.stride(1), ctx.rank, ctx.num_ranks, ctx.symm_barrier)
+            
     else:
         raise ValueError(f"Persistent not supported on XPU")
 
