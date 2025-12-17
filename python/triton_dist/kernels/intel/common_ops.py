@@ -91,6 +91,30 @@ def _volatile_load_int32(ptr):
 
 
 @triton.jit
+def _memory_fence_acquire(ptr):
+    """
+    Execute a memory fence with acquire semantics.
+
+    This ensures all subsequent memory reads will see values written by
+    the producer. Used after polling completes to guarantee data visibility.
+
+    NOTE: For proper synchronization, the producer should ideally use a
+    release fence after writing data and before setting the signal.
+    If the producer uses plain copy/store without release semantics,
+    this acquire fence provides best-effort cache invalidation but
+    may not guarantee visibility on all hardware.
+
+    Args:
+        ptr: Pointer to the signal location that was polled
+    """
+    # Use atomic_xchg with acquire+release (acq_rel) semantics for stronger ordering
+    # This acts as a full memory fence, invalidating cached values
+    # Read current value and write it back - this forces a round-trip to memory
+    current = tl.atomic_add(ptr, 0, sem="acquire")
+    tl.atomic_xchg(ptr, current, sem="acq_rel")
+
+
+@triton.jit
 def wait_signal(signal_ptr, expected_value):
     """
     Wait for a signal to reach the expected value.
@@ -106,6 +130,11 @@ def wait_signal(signal_ptr, expected_value):
     while _volatile_load_int32(signal_ptr) < expected_value:
         pass
 
+    # Memory fence: ensure all data written before the signal is visible
+    # This acquire fence pairs with the producer's release fence (if any)
+    # or ensures cache coherency for non-atomic stores
+    _memory_fence_acquire(signal_ptr)
+
 
 @triton.jit
 def wait_signal_range(signal_ptr, start_idx, count, expected_value):
@@ -113,6 +142,10 @@ def wait_signal_range(signal_ptr, start_idx, count, expected_value):
     Wait for a range of signals to reach the expected value.
 
     This is the Intel XPU equivalent of dl.wait() with multiple signals.
+
+    After all signals are received, a memory fence is executed to ensure
+    all data written by producers before setting their signals is visible
+    to this consumer kernel.
 
     Args:
         signal_ptr: Base pointer to the signal array
@@ -124,6 +157,13 @@ def wait_signal_range(signal_ptr, start_idx, count, expected_value):
         # Use atomic add with 0 to force memory read (volatile semantics)
         while _volatile_load_int32(signal_ptr + start_idx + i) < expected_value:
             pass
+
+    # Memory fence after all signals received
+    # Execute acquire fence on the last signal to ensure all prior
+    # data writes from all producers are visible
+    # This is critical when producers use copy_/tl.store without release semantics
+    if count > 0:
+        _memory_fence_acquire(signal_ptr + start_idx + count - 1)
 
 
 @triton.jit(do_not_specialize=["local_rank", "rank", "local_world_size"])
@@ -430,16 +470,42 @@ def _wait_eq_xpu(signal_tensor: torch.Tensor, signal: int, stream: Optional[torc
         pass
 
 
-def _set_signal_xpu(signal_tensor: torch.Tensor, signal: int, stream: Optional[torch.xpu.Stream] = None):
+@triton.jit
+def _atomic_store_signal_kernel(signal_ptr, value):
     """
-    Set a signal tensor to a specific value.
+    Atomically store a value to a signal with release semantics.
+
+    This ensures proper memory visibility when paired with atomic loads
+    using acquire semantics (e.g., in wait_signal/wait_signal_range).
 
     Args:
-        signal_tensor: Tensor to set
+        signal_ptr: Pointer to the signal location
+        value: The value to store
+    """
+    # Use atomic exchange with release semantics to ensure all prior
+    # memory operations (e.g., data copies) are visible to other
+    # work-groups/kernels that acquire this signal
+    tl.atomic_xchg(signal_ptr, value, sem="release")
+
+
+def _set_signal_xpu(signal_tensor: torch.Tensor, signal: int, stream: Optional[torch.xpu.Stream] = None):
+    """
+    Set a signal tensor to a specific value using atomic operation.
+
+    Uses atomic store with release semantics to ensure proper memory visibility
+    when paired with atomic reads using acquire semantics in consumer kernels.
+
+    IMPORTANT: This must use atomic operation (not fill_ or copy_) to ensure
+    that when GEMM kernel's wait_signal_range reads this value with atomic_add(0, acquire),
+    all prior memory operations (e.g., data copy operations) are visible.
+
+    Args:
+        signal_tensor: Tensor to set (must be int32 and on XPU)
         signal: The value to set
         stream: XPU stream (unused, operation is synchronous)
     """
-    signal_tensor.fill_(signal)
+    # Launch a minimal kernel to perform atomic store with release semantics
+    _atomic_store_signal_kernel[(1,)](signal_tensor, signal)
 
 
 def _memcpy_async_xpu(dst: torch.Tensor, src: torch.Tensor, nbytes: int, stream: Optional[torch.xpu.Stream] = None):
